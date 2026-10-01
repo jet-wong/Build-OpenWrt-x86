@@ -2,12 +2,19 @@
 # GitHub Actions 自动编译 OpenWrt（x86_64 / VMDK / OpenVPN / 中文 LuCI）
 # 源码：coolsnowwolf/lede（lean）
 #
+# v2 更新（2026-10-01）：
+#   - actions 升级到 Node24 时代版本：checkout@v7 / cache@v6 / upload-artifact@v7 / gh-release@v3
+#     （v4 会触发 "Node.js 20 is deprecated" 警告；Node20 已于 2026-09-23 从 runner 移除）
+#   - 公开仓库 runner 现在是 4 核 / 16GB，编译并行度自动跟进
+#   - 依赖列表去掉 Ubuntu 22.04 上不确定存在的包（libz-dev / upx）
+#   - 失败时自动收集编译日志，便于定位
+#
 # 用法：
-#   1. 新建 GitHub 仓库（建议 Public，Actions 免费额度无限）
+#   1. 新建 GitHub 仓库（建议 Public：免费无限 + 4核16GB；Private 只有 2核8GB 且限分钟）
 #   2. 仓库根目录放两个文件：
-#        .config                          <- 用 openwrt-x86-mini.config 改名
-#        .github/workflows/build-openwrt.yml   <- 本文件
-#   3. 进仓库 Actions 页面 -> Build OpenWrt x86 VMDK -> Run workflow
+#        .config                                <- openwrt-x86-mini.config 改名
+#        .github/workflows/build-openwrt.yml    <- 本文件
+#   3. Actions -> Build OpenWrt x86 VMDK -> Run workflow
 #   4. 跑完在 Artifacts 里下载 openwrt-x86-64-vmdk
 # ============================================================
 
@@ -18,6 +25,10 @@ on:
     inputs:
       release:
         description: '同时发布到 Release'
+        type: boolean
+        default: false
+      single_thread:
+        description: '单线程编译（报错看不清时勾选，更慢但日志干净）'
         type: boolean
         default: false
   push:
@@ -38,36 +49,42 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 350          # 免费版 Linux runner 上限 360 分钟
+    runs-on: ubuntu-22.04        # gcc-11，对 OpenWrt 宿主机工具最友好（24.04/26.04 是 gcc-13+，容易把隐式声明当错误）
+    timeout-minutes: 350         # 免费版 Linux runner 上限 360 分钟
 
     steps:
 
     - name: 检出仓库（含 .config）
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
 
     - name: 释放磁盘空间
       run: |
         df -h
         sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                   /opt/hostedtoolcache/CodeQL /usr/lib/jvm /opt/azureshell 2>/dev/null || true
+                   /opt/hostedtoolcache/CodeQL /usr/lib/jvm /usr/local/share/powershell \
+                   /usr/share/swift /usr/local/.ghcup /usr/share/gradle 2>/dev/null || true
         sudo docker image prune -a -f 2>/dev/null || true
         sudo apt-get clean
-        echo "--- 清理后 ---"
-        df -h
+        echo "--- 清理后可用空间 ---"
+        df -h /
 
     - name: 安装编译依赖
       run: |
         sudo apt-get update
-        sudo apt-get install -y build-essential asciidoc binutils bzip2 gawk gettext git \
-          libncurses5-dev libz-dev patch python3 python3-distutils unzip zlib1g-dev \
-          lib32gcc-s1 libc6-dev-i386 subversion flex uglifyjs gcc-multilib g++-multilib \
-          p7zip p7zip-full msmtp libssl-dev texinfo libglib2.0-dev xmlto qemu-utils upx \
-          libelf-dev autoconf automake libtool autopoint device-tree-compiler antlr3 gperf \
-          wget swig rsync ccache
+        sudo apt-get install -y --no-install-recommends \
+          build-essential asciidoc binutils bzip2 gawk gettext git \
+          zlib1g-dev patch python3 python3-distutils unzip \
+          lib32gcc-s1 libc6-dev-i386 subversion flex uglifyjs \
+          gcc-multilib g++-multilib p7zip p7zip-full msmtp libssl-dev \
+          texinfo libglib2.0-dev xmlto qemu-utils libelf-dev \
+          autoconf automake libtool autopoint device-tree-compiler \
+          gperf wget swig rsync ccache libncurses5-dev libncursesw5-dev
+        echo "--- 关键工具版本 ---"
+        awk -W version 2>/dev/null | head -1
+        gcc --version | head -1
 
     - name: 恢复缓存（dl 源码包 + ccache）
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: |
           lede/dl
@@ -83,23 +100,47 @@ jobs:
       run: |
         cp .config lede/.config
         cd lede
+        # 关键：ext4 分区必须装得下 rootfs。这套固件 rootfs 未压缩约 300MB，
+        # 256MB 会在最后一步 make_ext4fs 报 "failed to allocate ... out of space"，务必留足余量
+        sed -i 's/^CONFIG_TARGET_ROOTFS_PARTSIZE=.*/CONFIG_TARGET_ROOTFS_PARTSIZE=512/' .config
+        grep -q '^CONFIG_TARGET_ROOTFS_PARTSIZE=512' .config || echo 'CONFIG_TARGET_ROOTFS_PARTSIZE=512' >> .config
         echo "CONFIG_CCACHE=y" >> .config
         ./scripts/feeds update -a
         ./scripts/feeds install -a
         make defconfig
+        echo "=== 生效的目标机型 ==="
+        grep -E "^CONFIG_TARGET_(BOARD|SUBTARGET|PROFILE)" .config | head -5
 
     - name: 下载源码包
+      id: download
       run: cd lede && make -j$(nproc) download V=s
 
     - name: 编译固件
+      id: compile
       run: |
         cd lede
         export CCACHE_DIR="$GITHUB_WORKSPACE/.ccache"
-        export CCACHE_MAXSIZE=5G
+        export CCACHE_MAXSIZE=3G
         ccache -z
-        # 先多线程；失败则自动单线程重跑一次（便于看到真实报错）
-        make -j$(nproc) V=s || make -j1 V=s
+        if [ "${{ inputs.single_thread }}" = "true" ]; then
+          make -j1 V=s
+        else
+          # 先多线程；失败则单线程重跑一次，这样报错不会被并行日志冲掉
+          make -j$(nproc) V=s || make -j1 V=s
+        fi
         ccache -s
+
+    - name: 失败时收集日志
+      if: failure()
+      run: |
+        echo "=== 磁盘 ==="
+        df -h /
+        echo "=== 最近失败的编译日志 ==="
+        cd lede 2>/dev/null || exit 0
+        find logs build_dir -name "*.log" -newermt "-20 minutes" 2>/dev/null | head -10
+        for f in $(find logs -name "*.log" -newermt "-20 minutes" 2>/dev/null | head -3); do
+          echo "----- $f -----"; tail -40 "$f"
+        done
 
     - name: 整理产物
       run: |
@@ -109,7 +150,7 @@ jobs:
         ls -lh
 
     - name: 上传固件到 Artifacts
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: openwrt-x86-64-vmdk
         path: lede/bin/targets/x86/64/*
@@ -118,7 +159,7 @@ jobs:
 
     - name: 发布到 Release
       if: ${{ github.event_name == 'workflow_dispatch' && inputs.release }}
-      uses: softprops/action-gh-release@v2
+      uses: softprops/action-gh-release@v3
       with:
         tag_name: openwrt-x86-${{ github.run_number }}
         name: OpenWrt x86 VMDK #${{ github.run_number }}
@@ -127,7 +168,6 @@ jobs:
           机型：x86_64 generic
           镜像：ext4 + squashfs，含 VMDK
           插件：OpenVPN 服务器 + LuCI，中文界面
-          编译时间：${{ github.run_id }}
         files: lede/bin/targets/x86/64/*combined*.vmdk
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
