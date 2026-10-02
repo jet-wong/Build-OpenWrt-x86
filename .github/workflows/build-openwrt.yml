@@ -1,28 +1,23 @@
 # ============================================================
-# GitHub Actions 自动编译 OpenWrt（x86_64 / VMDK / OpenVPN / 中文 LuCI）
+# GitHub Actions 编译 OpenWrt（x86/64 / VMDK / OpenVPN + OpenVPN Server / 中文 LuCI）
 # 源码：coolsnowwolf/lede（lean）
 #
-# v2 更新（2026-10-01）：
-#   - actions 升级到 Node24 时代版本：checkout@v7 / cache@v6 / upload-artifact@v7 / gh-release@v3
-#     （v4 会触发 "Node.js 20 is deprecated" 警告；Node20 已于 2026-09-23 从 runner 移除）
-#   - 公开仓库 runner 现在是 4 核 / 16GB，编译并行度自动跟进
-#   - 依赖列表去掉 Ubuntu 22.04 上不确定存在的包（libz-dev / upx）
-#   - 失败时自动收集编译日志，便于定位
-#
-# v3 更新（2026-10-01）：
-#   - 关闭 push 自动触发（改一次文件就自动编译一小时，太费），改为纯手动 Run workflow
+# v4（2026-10-02）：
+#   - 加入 OpenVPN Server（luci-app-openvpn-server，lean luci feed 自带）
+#   - ** ONLY 手动触发（workflow_dispatch），不自动执行 **
+#     （不挂 push / schedule，改配置不会自动跑编译）
 #
 # 用法：
-#   1. 新建 GitHub 仓库（建议 Public：免费无限 + 4核16GB；Private 只有 2核8GB 且限分钟）
-#   2. 仓库根目录放两个文件：
-#        .config                                <- openwrt-x86-mini.config 改名
+#   1. 仓库根目录放两个文件：
+#        .config                                <- 本配置（openwrt-x86-64-openvpn-server.config 改名）
 #        .github/workflows/build-openwrt.yml    <- 本文件
-#   3. Actions -> Build OpenWrt x86 VMDK -> Run workflow
-#   4. 跑完在 Artifacts 里下载 openwrt-x86-64-vmdk
+#   2. Actions -> Build OpenWrt x86 VMDK -> Run workflow（手动点）
+#   3. 跑完在 Artifacts 里下载 openwrt-x86-64-vmdk
 # ============================================================
 
 name: Build OpenWrt x86 VMDK
 
+# 仅手动触发，不自动执行（无 push / schedule）
 on:
   workflow_dispatch:
     inputs:
@@ -34,16 +29,6 @@ on:
         description: '单线程编译（报错看不清时勾选，更慢但日志干净）'
         type: boolean
         default: false
-  # push 触发已关闭：改一次配置就自动跑一小时编译，太浪费。
-  # 现在只在 Actions 页面手动点 Run workflow 才会跑。
-  # 想恢复「改配置自动编译」，把下面这段的注释去掉：
-  # push:
-  #   paths:
-  #     - '.config'
-  #     - '.github/workflows/build-openwrt.yml'
-  # 定时编译（每周日 04:00 UTC）：
-  # schedule:
-  #   - cron: '0 4 * * 0'
 
 permissions:
   contents: write
@@ -106,8 +91,8 @@ jobs:
       run: |
         cp .config lede/.config
         cd lede
-        # 关键：ext4 分区必须装得下 rootfs。这套固件 rootfs 未压缩约 300MB，
-        # 256MB 会在最后一步 make_ext4fs 报 "failed to allocate ... out of space"，务必留足余量
+        # ext4 分区必须装得下 rootfs。这套固件 rootfs 未压缩约 300MB，
+        # 256MB 会在最后一步 make_ext4fs 报 "out of space"，这里直接留 512MB
         sed -i 's/^CONFIG_TARGET_ROOTFS_PARTSIZE=.*/CONFIG_TARGET_ROOTFS_PARTSIZE=512/' .config
         grep -q '^CONFIG_TARGET_ROOTFS_PARTSIZE=512' .config || echo 'CONFIG_TARGET_ROOTFS_PARTSIZE=512' >> .config
         echo "CONFIG_CCACHE=y" >> .config
@@ -116,6 +101,8 @@ jobs:
         make defconfig
         echo "=== 生效的目标机型 ==="
         grep -E "^CONFIG_TARGET_(BOARD|SUBTARGET|PROFILE)" .config | head -5
+        echo "=== OpenVPN / Server / LuCI 中文 是否真正选中（defconfig 会静默剔除依赖不满足的）==="
+        grep -E "^CONFIG_PACKAGE_(openvpn-openssl|luci-app-openvpn|luci-app-openvpn-server|luci-i18n-openvpn-server-zh_Hans|kmod-tun)" .config || echo "!!! 有包未选中，检查包名"
 
     - name: 下载源码包
       id: download
@@ -131,7 +118,7 @@ jobs:
         if [ "${{ inputs.single_thread }}" = "true" ]; then
           make -j1 V=s
         else
-          # 先多线程；失败则单线程重跑一次，这样报错不会被并行日志冲掉
+          # 先多线程；失败则单线程重跑一次，报错不会被并行日志冲掉
           make -j$(nproc) V=s || make -j1 V=s
         fi
         ccache -s
@@ -151,16 +138,27 @@ jobs:
     - name: 整理产物
       run: |
         cd lede/bin/targets/x86/64
-        rm -rf packages
-        echo "=== 产物列表 ==="
-        ls -lh
+        echo "=== 镜像 ==="
+        ls -lh *.vmdk *.img.gz 2>/dev/null || ls -lh
+        echo "=== 打进镜像的 openvpn / luci 相关 ipk ==="
+        find packages -iname "*openvpn*" 2>/dev/null | head -10
 
     - name: 上传固件到 Artifacts
       uses: actions/upload-artifact@v7
       with:
         name: openwrt-x86-64-vmdk
-        path: lede/bin/targets/x86/64/*
+        path: |
+          lede/bin/targets/x86/64/*.vmdk
+          lede/bin/targets/x86/64/*.img.gz
         compression-level: 0        # 镜像本身已压缩，再压只浪费时间
+        retention-days: 30
+
+    - name: 上传 ipk 包（便于核对装了什么）
+      uses: actions/upload-artifact@v7
+      with:
+        name: openwrt-ipk-packages
+        path: lede/bin/targets/x86/64/packages/
+        compression-level: 9
         retention-days: 30
 
     - name: 发布到 Release
@@ -173,7 +171,7 @@ jobs:
           源码：coolsnowwolf/lede (${{ env.REPO_BRANCH }})
           机型：x86_64 generic
           镜像：ext4 + squashfs，含 VMDK
-          插件：OpenVPN 服务器 + LuCI，中文界面
+          插件：OpenVPN + OpenVPN Server + LuCI，中文界面
         files: lede/bin/targets/x86/64/*combined*.vmdk
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
