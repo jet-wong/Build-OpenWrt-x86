@@ -2,6 +2,10 @@
 # GitHub Actions 编译 OpenWrt（x86/64 / VMDK / OpenVPN + OpenVPN Server / 中文 LuCI）
 # 源码：coolsnowwolf/lede（lean）
 #
+# v5（2026-10-02 11:17）：
+#   - 修复：克隆源码挪到恢复缓存之前
+#     （缓存含 lede/dl，恢复会创建 lede/ 目录，先 clone 会报 destination exists）
+#
 # v4（2026-10-02）：
 #   - 加入 OpenVPN Server（luci-app-openvpn-server，lean luci feed 自带）
 #   - ** ONLY 手动触发（workflow_dispatch），不自动执行 **
@@ -74,6 +78,12 @@ jobs:
         awk -W version 2>/dev/null | head -1
         gcc --version | head -1
 
+    - name: 克隆源码
+      run: |
+        # 必须在恢复缓存之前：缓存里带 lede/dl 路径，恢复时 actions/cache 会把 lede/ 目录
+        # 建出来，若先恢复再 clone 会报 "destination path 'lede' already exists"
+        git clone --depth 1 "$REPO_URL" -b "$REPO_BRANCH" lede
+
     - name: 恢复缓存（dl 源码包 + ccache）
       uses: actions/cache@v6
       with:
@@ -83,9 +93,6 @@ jobs:
         key: owrt-${{ runner.os }}-${{ hashFiles('.config') }}
         restore-keys: |
           owrt-${{ runner.os }}-
-
-    - name: 克隆源码
-      run: git clone --depth 1 "$REPO_URL" -b "$REPO_BRANCH" lede
 
     - name: 载入配置 + 更新 feeds
       run: |
